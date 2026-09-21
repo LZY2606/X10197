@@ -36,10 +36,6 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
     private val stack = mutableListOf<String>()
     private val foreignContext = mutableListOf<Boolean>()
 
-    private val buffers = mutableListOf<String>()
-    private var bufferOffset = 0
-    /** The index of the last written buffer. Used when resuming after a `pause()`. */
-    private var writeIndex = 0
     /** Indicates whether the parser has finished running / `.end` has been called. */
     private var ended = false
 
@@ -348,9 +344,6 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         this.startIndex = 0
         this.endIndex = 0
         this.handler.onParserInit(this)
-        this.buffers.clear()
-        this.bufferOffset = 0
-        this.writeIndex = 0
         this.ended = false
     }
 
@@ -365,32 +358,15 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         this.end(data)
     }
 
+    /**
+     * Resolve an absolute token span to its raw text. The tokenizer's internal
+     * cursor retains exactly the segments the pending tokens reference, so this
+     * performs at most one allocation and never keeps the whole stream alive.
+     */
     private fun getSlice(
         start: Int,
         end: Int
-    ): String {
-        while (start - this.bufferOffset >= this.buffers.first().length) {
-            this.shiftBuffer()
-        }
-
-        var slice = this.buffers.first().substring(
-            start - this.bufferOffset,
-            end - this.bufferOffset
-        )
-
-        while (end - this.bufferOffset > this.buffers.first().length) {
-            this.shiftBuffer()
-            slice += this.buffers.first().substring(0, end - this.bufferOffset)
-        }
-
-        return slice
-    }
-
-    private fun shiftBuffer() {
-        this.bufferOffset += this.buffers.first().length
-        this.writeIndex--
-        this.buffers.removeFirst()
-    }
+    ): String = this.ksoupTokenizer.getSlice(start, end)
 
     /**
      * Parses a chunk of data and calls the corresponding callbacks.
@@ -403,11 +379,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
             return
         }
 
-        this.buffers.add(chunk)
-        if (this.ksoupTokenizer.running) {
-            this.ksoupTokenizer.write(chunk)
-            this.writeIndex++
-        }
+        this.ksoupTokenizer.write(chunk)
     }
 
     /**
@@ -438,13 +410,6 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
      */
     public fun resume() {
         this.ksoupTokenizer.resume()
-
-        while (
-            this.ksoupTokenizer.running &&
-            this.writeIndex < this.buffers.size
-        ) {
-            this.ksoupTokenizer.write(this.buffers[this.writeIndex++])
-        }
 
         if (this.ended) this.ksoupTokenizer.end()
     }

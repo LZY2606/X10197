@@ -8,6 +8,9 @@ import com.mohamedrejeb.ksoup.html.parser.KsoupHtmlParser
  * KsoupTokenizer is an HTML Tokenizer which is able to receive HTML string,
  * breaks it up into individual tokens, and return those tokens with the [KsoupTokenizerCallbacks]
  *
+ * All input positions and pending-token lifecycle live in the single internal
+ * [cursor]. This class only owns the state machine.
+ *
  * @param options KsoupHtmlOptions
  *
  */
@@ -18,16 +21,11 @@ internal class KsoupTokenizer(
     private val xmlMode = options.xmlMode
     private val decodeEntities = options.decodeEntities
 
+    /** Owns absolute spans, the current pending position, and retained input. */
+    private val cursor = TokenCursor()
+
     /** The current state the tokenizer is in. */
     private var state = State.Text
-    /** The read buffer. */
-    private var buffer = ""
-    /** The beginning of the section that is currently being read. */
-    private var sectionStart = 0
-    /** The index within the buffer that we are currently looking at. */
-    private var index = 0
-    /** The start of the last entity. */
-    private var entityStart = 0
     /**
      * Some behavior, e.g., When decoding entities, is done while we are in another state.
      * This keeps track of the other state type.
@@ -37,25 +35,29 @@ internal class KsoupTokenizer(
     private var isSpecial = false
     /** Indicates whether the tokenizer has been paused. */
     public var running: Boolean = true
-    /** The offset of the current buffer. */
-    private var offset = 0
+
+    /** Internal diagnostics used by streaming lifecycle tests. */
+    val retainedLength: Int get() = cursor.retainedLength
+    val peakRetainedLength: Int get() = cursor.peakRetainedLength
+    val totalInputLength: Int get() = cursor.totalLength
+    val multiSegmentSliceCount: Int get() = cursor.multiSegmentSliceCount
+    val copiedCharacterCount: Long get() = cursor.copiedCharacterCount
+
+    /** Materialize the raw input for an absolute token span. */
+    fun getSlice(start: Int, end: Int): String = cursor.slice(start, end)
 
     @OptIn(ExperimentalUnsignedTypes::class)
     fun reset() {
         this.state = State.Text
-        this.buffer = ""
-        this.sectionStart = 0
-        this.index = 0
         this.baseState = State.Text
         this.currentSequence = null
         this.running = true
-        this.offset = 0
+        this.cursor.reset()
     }
 
     fun write(chunk: String) {
-        this.offset += this.buffer.length
-        this.buffer = chunk
-        this.parse()
+        this.cursor.write(chunk)
+        if (this.running) this.parse()
     }
 
     fun end() {
@@ -68,10 +70,22 @@ internal class KsoupTokenizer(
 
     fun resume() {
         this.running = true
-        if (this.index < this.buffer.length + this.offset) {
+        if (this.cursor.hasMore()) {
             this.parse()
         }
     }
+
+    private var index: Int
+        get() = cursor.index
+        set(value) { cursor.index = value }
+
+    private var sectionStart: Int
+        get() = cursor.sectionStart
+        set(value) { cursor.sectionStart = value }
+
+    private var entityStart: Int
+        get() = cursor.entityStart
+        set(value) { cursor.entityStart = value }
 
     private fun stateText(c: Int) {
         if (
@@ -135,7 +149,7 @@ internal class KsoupTokenizer(
                 }
 
                 this.isSpecial = false
-                this.sectionStart = endOfText + 2 // Skip over the `</`
+                this.cursor.sectionStart = endOfText + 2 // Skip over the `</`
                 this.stateInClosingTagName(c)
                 return // We are done skip the rest of the function.
             }
@@ -184,20 +198,20 @@ internal class KsoupTokenizer(
      * @returns Whether the character was found.
      */
     private fun fastForwardTo(c: Int): Boolean {
-        while (this.index < this.buffer.length + this.offset) {
-            if (this.buffer[this.index - this.offset].code == c) {
+        while (this.cursor.hasMore()) {
+            if (this.cursor.charAt(this.index).code == c) {
                 return true
             }
-            index++
+            this.index += 1
         }
 
         /*
          * We increment the index at the end of the `parse` loop,
-         * so set it to `buffer.length - 1` here.
+         * so set it to `end - 1` here.
          *
          * TODO: Refactor `parse` to increment index before calling states.
          */
-        this.index = this.buffer.length + this.offset - 1
+        this.index = this.cursor.end() - 1
 
         return false
     }
@@ -530,21 +544,23 @@ internal class KsoupTokenizer(
     private fun startEntity() {
         this.baseState = this.state
         this.state = State.InEntity
-        this.entityStart = this.index
+        this.cursor.beginEntity()
     }
 
     private fun stateInEntity(c: Int) {
         if (c == CharCodes.Semi.code) {
             val decoded = KsoupEntities.decodeHtml(
-                this.buffer.substring(this.entityStart - this.offset, this.index - this.offset + 1)
+                this.cursor.slice(this.entityStart, this.index + 1)
             )
 
             this.state = this.baseState
+            this.cursor.clearEntity()
             if (decoded.isEmpty()) {
                 this.index = this.entityStart
             } else {
                 emitCodePoint(decoded.first().code, this.index + 1 - this.entityStart)
             }
+            return
         }
 
         if (
@@ -552,6 +568,7 @@ internal class KsoupTokenizer(
             !isInEntityChar(c)
         ) {
             this.state = this.baseState
+            this.cursor.clearEntity()
             this.index = this.entityStart
         }
     }
@@ -577,10 +594,14 @@ internal class KsoupTokenizer(
                 this.sectionStart = this.index
             }
         }
+
+        // Everything the pending token still needs remains resident; leading
+        // segments that no one references are released here.
+        this.cursor.releaseConsumedPrefix()
     }
 
     private fun shouldContinue(): Boolean {
-        return this.index < this.buffer.length + this.offset && this.running
+        return this.cursor.hasMore() && this.running
     }
 
     /**
@@ -590,7 +611,7 @@ internal class KsoupTokenizer(
      */
     private fun parse() {
         while (this.shouldContinue()) {
-            val c = this.buffer[this.index - this.offset].code
+            val c = this.cursor.charAt(this.index).code
             when (this.state) {
                 State.Text ->
                     this.stateText(c)
@@ -652,20 +673,22 @@ internal class KsoupTokenizer(
 
     private fun finish() {
         if (this.state == State.InEntity) {
-            // Todo remove entityDecoder
-//            this.entityDecoder.end()
             this.state = this.baseState
+            this.cursor.clearEntity()
         }
 
         this.handleTrailingData()
 
         this.callbacks.onEnd()
+
+        // All tokens are complete; the cursor can release the remaining input.
+        this.cursor.releaseConsumedPrefix()
     }
 
     /** Handle any trailing data. */
     @OptIn(ExperimentalUnsignedTypes::class)
     private fun handleTrailingData() {
-        val endIndex = this.buffer.length + this.offset
+        val endIndex = this.cursor.end()
 
         // If there is no remaining data, we are done.
         if (this.sectionStart >= endIndex) {
