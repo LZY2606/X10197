@@ -29,6 +29,15 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
      */
     private var openTagStart = 0
 
+    /**
+     * Consecutive plain-text callbacks describe one logical text node; with
+     * streamed input a single text node may be reported at several write
+     * boundaries. Accumulate until a non-text event occurs. Entity callbacks
+     * deliberately break the run, preserving the historical event boundaries.
+     */
+    private var lastTextEvent = false
+    private var pendingText = ""
+
     private var tagName = ""
     private var attribName = ""
     private var attribValue = ""
@@ -36,10 +45,6 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
     private val stack = mutableListOf<String>()
     private val foreignContext = mutableListOf<Boolean>()
 
-    private val buffers = mutableListOf<String>()
-    private var bufferOffset = 0
-    /** The index of the last written buffer. Used when resuming after a `pause()`. */
-    private var writeIndex = 0
     /** Indicates whether the parser has finished running / `.end` has been called. */
     private var ended = false
 
@@ -52,17 +57,27 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
 
         override fun onText(start: Int, endIndex: Int) {
             this@KsoupHtmlParser.callbacks.onText(start, endIndex)
-            val data = this@KsoupHtmlParser.getSlice(start, endIndex)
+            this@KsoupHtmlParser.pendingText += this@KsoupHtmlParser.getSlice(start, endIndex)
+            this@KsoupHtmlParser.lastTextEvent = true
             this@KsoupHtmlParser.endIndex = endIndex - 1
-            this@KsoupHtmlParser.handler.onText(data)
             this@KsoupHtmlParser.startIndex = endIndex
         }
 
         override fun onTextEntity(codepoint: Int, endIndex: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onTextEntity(codepoint, endIndex)
             this@KsoupHtmlParser.endIndex = endIndex - 1
             this@KsoupHtmlParser.handler.onText(Char(codepoint).toString())
             this@KsoupHtmlParser.startIndex = endIndex
+        }
+
+        private fun flushText() {
+            if (this@KsoupHtmlParser.lastTextEvent) {
+                this@KsoupHtmlParser.lastTextEvent = false
+                val data = this@KsoupHtmlParser.pendingText
+                this@KsoupHtmlParser.pendingText = ""
+                this@KsoupHtmlParser.handler.onText(data)
+            }
         }
 
         private fun isVoidElement(name: String): Boolean {
@@ -70,6 +85,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onOpenTagName(start: Int, endIndex: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onOpenTagName(start, endIndex)
             this@KsoupHtmlParser.endIndex = endIndex
 
@@ -126,6 +142,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onOpenTagEnd(endIndex: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onOpenTagEnd(endIndex)
             this@KsoupHtmlParser.endIndex = endIndex
             this.endOpenTag(false)
@@ -135,6 +152,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onCloseTag(start: Int, endIndex: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onCloseTag(start, endIndex)
             this@KsoupHtmlParser.endIndex = endIndex
 
@@ -177,6 +195,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onSelfClosingTag(endIndex: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onSelfClosingTag(endIndex)
             this@KsoupHtmlParser.endIndex = endIndex
             if (
@@ -265,6 +284,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onDeclaration(start: Int, endIndex: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onDeclaration(start, endIndex)
             this@KsoupHtmlParser.endIndex = endIndex
             val value = this@KsoupHtmlParser.getSlice(start, endIndex)
@@ -277,6 +297,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onProcessingInstruction(start: Int, endIndex: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onProcessingInstruction(start, endIndex)
             this@KsoupHtmlParser.endIndex = endIndex
             val value = this@KsoupHtmlParser.getSlice(start, endIndex)
@@ -289,6 +310,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onComment(start: Int, endIndex: Int, offset: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onComment(start, endIndex, offset)
             this@KsoupHtmlParser.endIndex = endIndex
 
@@ -300,6 +322,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onCData(start: Int, endIndex: Int, offset: Int) {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onCData(start, endIndex, offset)
             this@KsoupHtmlParser.endIndex = endIndex
             val value = this@KsoupHtmlParser.getSlice(start, endIndex - offset)
@@ -318,6 +341,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         }
 
         override fun onEnd() {
+            this.flushText()
             this@KsoupHtmlParser.callbacks.onEnd()
             // Set the end index for all remaining tags
             this@KsoupHtmlParser.endIndex = this@KsoupHtmlParser.startIndex
@@ -344,13 +368,12 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         this.attribName = ""
         this.attribValue = ""
         this.attribs = null
+        this.lastTextEvent = false
+        this.pendingText = ""
         this.stack.clear()
         this.startIndex = 0
         this.endIndex = 0
         this.handler.onParserInit(this)
-        this.buffers.clear()
-        this.bufferOffset = 0
-        this.writeIndex = 0
         this.ended = false
     }
 
@@ -368,29 +391,7 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
     private fun getSlice(
         start: Int,
         end: Int
-    ): String {
-        while (start - this.bufferOffset >= this.buffers.first().length) {
-            this.shiftBuffer()
-        }
-
-        var slice = this.buffers.first().substring(
-            start - this.bufferOffset,
-            end - this.bufferOffset
-        )
-
-        while (end - this.bufferOffset > this.buffers.first().length) {
-            this.shiftBuffer()
-            slice += this.buffers.first().substring(0, end - this.bufferOffset)
-        }
-
-        return slice
-    }
-
-    private fun shiftBuffer() {
-        this.bufferOffset += this.buffers.first().length
-        this.writeIndex--
-        this.buffers.removeFirst()
-    }
+    ): String = this.ksoupTokenizer.slice(start, end)
 
     /**
      * Parses a chunk of data and calls the corresponding callbacks.
@@ -403,11 +404,9 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
             return
         }
 
-        this.buffers.add(chunk)
-        if (this.ksoupTokenizer.running) {
-            this.ksoupTokenizer.write(chunk)
-            this.writeIndex++
-        }
+        // While paused the tokenizer retains the chunk itself; it must not
+        // advance its cursor and no events are emitted.
+        this.ksoupTokenizer.write(chunk)
     }
 
     /**
@@ -437,16 +436,9 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
      * Resumes parsing after `pause` was called.
      */
     public fun resume() {
+        // The tokenizer drains any chunks delivered while paused, retaining
+        // their absolute positions, and finishes if end() already arrived.
         this.ksoupTokenizer.resume()
-
-        while (
-            this.ksoupTokenizer.running &&
-            this.writeIndex < this.buffers.size
-        ) {
-            this.ksoupTokenizer.write(this.buffers[this.writeIndex++])
-        }
-
-        if (this.ended) this.ksoupTokenizer.end()
     }
 
     public enum class QuoteType {

@@ -20,14 +20,23 @@ internal class KsoupTokenizer(
 
     /** The current state the tokenizer is in. */
     private var state = State.Text
-    /** The read buffer. */
-    private var buffer = ""
+    /**
+     * Single owner of absolute positions and of the input segments that must
+     * still be retained.
+     */
+    private val cursor = TokenCursor()
     /** The beginning of the section that is currently being read. */
-    private var sectionStart = 0
-    /** The index within the buffer that we are currently looking at. */
-    private var index = 0
+    private var sectionStart: Int
+        get() = cursor.sectionStart
+        set(value) { cursor.sectionStart = value }
+    /** The index within the input that is currently being read. */
+    private var index: Int
+        get() = cursor.index
+        set(value) { cursor.index = value }
     /** The start of the last entity. */
-    private var entityStart = 0
+    private var entityStart: Int
+        get() = cursor.entityStart
+        set(value) { cursor.entityStart = value }
     /**
      * Some behavior, e.g., When decoding entities, is done while we are in another state.
      * This keeps track of the other state type.
@@ -37,29 +46,52 @@ internal class KsoupTokenizer(
     private var isSpecial = false
     /** Indicates whether the tokenizer has been paused. */
     public var running: Boolean = true
-    /** The offset of the current buffer. */
-    private var offset = 0
+        private set
+    /** Indicates whether [end] has already consumed the stream. */
+    private var ended = false
+
+    /** Number of UTF-16 units currently retained by the cursor. Test-only metric. */
+    internal val retainedLength: Int get() = cursor.retainedLength
+    /** Number of active input segments currently retained. Test-only metric. */
+    internal val retainedSegmentCount: Int get() = cursor.retainedSegmentCount
+    /** Number of chunks queued while the tokenizer was paused. Test-only metric. */
+    internal val pendingChunkCount: Int get() = cursor.pendingCount
+    /** UTF-16 units copied for slices spanning more than one segment. */
+    internal val crossSegmentCopyCount: Int get() = cursor.crossSegmentCopyCount
+    /** Largest unfinished-token span currently keeping data alive. Test-only metric. */
+    internal val maxPendingTokenSize: Int
+        get() = if (cursor.retainedLength == 0) 0 else cursor.end - retainHorizon()
+
+    /** Reads an absolute span of original input units. Used by the parser. */
+    internal fun slice(start: Int, end: Int): String = cursor.substring(start, end)
 
     @OptIn(ExperimentalUnsignedTypes::class)
     fun reset() {
         this.state = State.Text
-        this.buffer = ""
-        this.sectionStart = 0
-        this.index = 0
+        this.cursor.reset()
         this.baseState = State.Text
         this.currentSequence = null
         this.running = true
-        this.offset = 0
+        this.ended = false
     }
 
     fun write(chunk: String) {
-        this.offset += this.buffer.length
-        this.buffer = chunk
-        this.parse()
+        if (this.running) {
+            this.cursor.appendActive(chunk)
+            this.parse()
+        } else {
+            // While paused the cursor must not advance; keep the chunk so a
+            // later resume drains it in arrival order.
+            this.cursor.queuePending(chunk)
+        }
     }
 
     fun end() {
-        if (this.running) this.finish()
+        // end() is idempotent: repeated calls never re-emit callbacks.
+        if (!this.ended) {
+            this.ended = true
+            if (this.running) this.finish()
+        }
     }
 
     fun pause() {
@@ -67,9 +99,17 @@ internal class KsoupTokenizer(
     }
 
     fun resume() {
-        this.running = true
-        if (this.index < this.buffer.length + this.offset) {
+        if (!this.running) {
+            this.running = true
             this.parse()
+        }
+        while (this.running && this.cursor.hasPending) {
+            val chunk = this.cursor.nextPending() ?: break
+            this.cursor.appendActive(chunk)
+            this.parse()
+        }
+        if (this.ended && this.running) {
+            this.finish()
         }
     }
 
@@ -168,7 +208,7 @@ internal class KsoupTokenizer(
                 this.state = State.InCommentLike
                 this.currentSequence = Sequences.CdataEnd
                 this.sequenceIndex = 0
-                this.sectionStart = index + 1
+                this.sectionStart = this.cursor.index + 1
             }
         } else {
             this.sequenceIndex = 0
@@ -184,20 +224,18 @@ internal class KsoupTokenizer(
      * @returns Whether the character was found.
      */
     private fun fastForwardTo(c: Int): Boolean {
-        while (this.index < this.buffer.length + this.offset) {
-            if (this.buffer[this.index - this.offset].code == c) {
+        while (this.cursor.index < this.cursor.end) {
+            if (this.cursor.charAt(this.cursor.index) == c) {
                 return true
             }
-            index++
+            this.cursor.index++
         }
 
         /*
          * We increment the index at the end of the `parse` loop,
-         * so set it to `buffer.length - 1` here.
-         *
-         * TODO: Refactor `parse` to increment index before calling states.
+         * so set it to the last readable position here.
          */
-        this.index = this.buffer.length + this.offset - 1
+        this.cursor.index = this.cursor.end - 1
 
         return false
     }
@@ -536,7 +574,7 @@ internal class KsoupTokenizer(
     private fun stateInEntity(c: Int) {
         if (c == CharCodes.Semi.code) {
             val decoded = KsoupEntities.decodeHtml(
-                this.buffer.substring(this.entityStart - this.offset, this.index - this.offset + 1)
+                this.cursor.substring(this.entityStart, this.index + 1)
             )
 
             this.state = this.baseState
@@ -577,10 +615,36 @@ internal class KsoupTokenizer(
                 this.sectionStart = this.index
             }
         }
+
+        this.cursor.releasePrefix(this.retainHorizon())
+    }
+
+    /**
+     * Absolute position before which every active segment can be freed: the
+     * oldest unit that any unfinished token (or the cursor itself) may still
+     * read or rewind to.
+     */
+    private fun retainHorizon(): Int {
+        var horizon = this.index
+        if (this.sectionStart >= 0 && this.sectionStart < horizon) {
+            horizon = this.sectionStart
+        }
+        if (this.state == State.InEntity && this.entityStart < horizon) {
+            horizon = this.entityStart
+        }
+        // While matching `</script` / `-->` etc., a partial match may restart
+        // against characters behind the cursor; keep the whole candidate span.
+        if (this.currentSequence != null && this.sequenceIndex > 0) {
+            val sequenceStart = this.index - this.sequenceIndex + 1
+            if (sequenceStart < horizon) {
+                horizon = sequenceStart
+            }
+        }
+        return horizon
     }
 
     private fun shouldContinue(): Boolean {
-        return this.index < this.buffer.length + this.offset && this.running
+        return this.cursor.index < this.cursor.end && this.running
     }
 
     /**
@@ -590,7 +654,7 @@ internal class KsoupTokenizer(
      */
     private fun parse() {
         while (this.shouldContinue()) {
-            val c = this.buffer[this.index - this.offset].code
+            val c = this.cursor.charAt(this.cursor.index)
             when (this.state) {
                 State.Text ->
                     this.stateText(c)
@@ -660,12 +724,14 @@ internal class KsoupTokenizer(
         this.handleTrailingData()
 
         this.callbacks.onEnd()
+
+        this.cursor.releasePrefix(this.cursor.end)
     }
 
     /** Handle any trailing data. */
     @OptIn(ExperimentalUnsignedTypes::class)
     private fun handleTrailingData() {
-        val endIndex = this.buffer.length + this.offset
+        val endIndex = this.cursor.end
 
         // If there is no remaining data, we are done.
         if (this.sectionStart >= endIndex) {
