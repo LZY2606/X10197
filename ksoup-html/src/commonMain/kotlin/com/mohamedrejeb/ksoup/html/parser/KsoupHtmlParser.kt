@@ -334,6 +334,9 @@ public class KsoupHtmlParser @ExperimentalKsoupApi constructor(
         callbacks = ksoupTokenizerCallbacks
     )
 
+    /** Internal test hook: exposes the tokenizer for streaming contract tests. */
+    internal fun testTokenizer(): KsoupTokenizer = this.ksoupTokenizer
+
     /**
      * Resets the parser to a blank state, ready to parse a new HTML document
      */

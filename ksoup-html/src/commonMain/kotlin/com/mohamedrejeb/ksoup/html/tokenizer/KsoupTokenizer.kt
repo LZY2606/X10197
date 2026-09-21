@@ -40,6 +40,15 @@ internal class KsoupTokenizer(
     /** The offset of the current buffer. */
     private var offset = 0
 
+    /**
+     * Total number of UTF-16 code units written to the tokenizer so far.
+     *
+     * Internal diagnostics hook used by the streaming contract tests to pin the
+     * absolute EOF position. Does not influence tokenization.
+     */
+    internal val inputLength: Int
+        get() = this.offset + this.buffer.length
+
     @OptIn(ExperimentalUnsignedTypes::class)
     fun reset() {
         this.state = State.Text
